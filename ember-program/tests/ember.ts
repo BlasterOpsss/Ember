@@ -74,7 +74,7 @@ describe("ember", () => {
 
   it("initializes config", async () => {
     await program.methods.initializeConfig(platform.publicKey)
-      .accounts({ admin: user, config, systemProgram: sys }).rpc();
+      .accounts({ admin: user, config, publicPool: pda([Buffer.from("pool")]), systemProgram: sys }).rpc();
     const c = await program.account.config.fetch(config);
     assert.equal(c.platformWallet.toBase58(), platform.publicKey.toBase58());
   });
@@ -271,6 +271,7 @@ describe("check-in and community streak", function () {
   const DAY = 6;
   const m = Keypair.generate();
   const I = ids(m.publicKey);
+  // Use the validator's own clock: it can lag the wall clock by seconds.
   const chainNow = async () =>
     Number((await provider.connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, "processed"))!.data.readBigInt64LE(32));
   const curDay = async () => Math.floor((await chainNow()) / DAY);
@@ -281,6 +282,7 @@ describe("check-in and community streak", function () {
   const checkIn = (d: number) =>
     program.methods.checkIn(d).accounts({
       user, coin: I.coin, mint: m.publicKey, userToken: I.userToken, walletState: I.walletState,
+      weight: pda([Buffer.from("weight"), I.coin.toBuffer(), Buffer.from([0]), user.toBuffer()]),
       checkIn: pda([Buffer.from("checkin"), I.coin.toBuffer(), Buffer.from([1]), dayBuf(d), user.toBuffer()]),
       dayStats: dayStats(d), tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: sys,
     }).rpc().catch(logErr);
@@ -350,5 +352,125 @@ describe("check-in and community streak", function () {
     const c = await program.account.coin.fetch(I.coin);
     assert.equal(c.communityStreak, 0);
     assert.equal(c.bestCommunityStreak, 2);
+  });
+});
+
+// Needs a build with --features short-life (12 second life, 8 second vote, 5 second claim window).
+describe("treasury payout", function () {
+  this.timeout(240000);
+  const m = Keypair.generate();
+  const I = ids(m.publicKey);
+  const pool = pda([Buffer.from("pool")]);
+  const clockNow = async () =>
+    Number((await provider.connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, "processed"))!.data.readBigInt64LE(32));
+  const dayBuf = (d: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(d); return b; };
+  const distPda = (e: number) => pda([Buffer.from("dist"), I.coin.toBuffer(), Buffer.from([e])]);
+  const weightPda = (e: number) =>
+    pda([Buffer.from("weight"), I.coin.toBuffer(), Buffer.from([e]), user.toBuffer()]);
+  let vote: PublicKey;
+  let cap = 0;
+  let snapshot = 0;
+
+  const claimAccounts = () => ({
+    user, config, coin: I.coin, distribution: distPda(0), weight: weightPda(0),
+    treasury: I.treasury, systemProgram: sys,
+  });
+
+  before(async function () {
+    try {
+      await program.methods.createCoin(new BN(12), 300, 5000, 2000, 0)
+        .accounts(createAccounts(m.publicKey)).signers([m]).rpc();
+    } catch (e) {
+      if (String(e).includes("BadLifespan")) this.skip();
+      throw e;
+    }
+    await program.methods.buy(SOL(0.5), new BN(1)).accounts(tradeAccounts(m.publicKey)).rpc();
+    const day = Math.floor((await clockNow()) / 6);
+    await program.methods.checkIn(day).accounts({
+      user, coin: I.coin, mint: m.publicKey, userToken: I.userToken, walletState: I.walletState,
+      weight: weightPda(0),
+      checkIn: pda([Buffer.from("checkin"), I.coin.toBuffer(), Buffer.from([1]), dayBuf(day), user.toBuffer()]),
+      dayStats: pda([Buffer.from("day"), I.coin.toBuffer(), Buffer.from([1]), dayBuf(day)]),
+      tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: sys,
+    }).rpc();
+  });
+
+  it("check-in adds reward weight: tokens held x streak", async () => {
+    const w = await program.account.weightRecord.fetch(weightPda(0));
+    const bal = await tokBal(I.userToken);
+    assert.equal(w.weight.toString(), bal.toString()); // streak is 1 on the first day
+    const c = await program.account.coin.fetch(I.coin);
+    assert.equal(c.epochWeight.toString(), bal.toString());
+  });
+
+  it("the coin ends; holders vote to release the treasury and the coin dies", async () => {
+    const end = (await program.account.coin.fetch(I.coin)).endTs.toNumber();
+    while ((await clockNow()) < end + 1) await sleep(300);
+    vote = votePda(I.coin, 1);
+    await program.methods.closeCoin().accounts({
+      caller: user, coin: I.coin, mint: m.publicKey, tokenVault: I.tokenVault, vote,
+      tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: sys,
+    }).rpc();
+    const all = await tokBal(I.userToken);
+    await program.methods.castVote(new BN(all.toString()), false, true).accounts({
+      voter: user, coin: I.coin, mint: m.publicKey, vote, record: recordPda(vote),
+      voterToken: I.userToken, escrow: ata(m.publicKey, vote, true),
+      tokenProgram: TOKEN_2022_PROGRAM_ID, associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram: sys,
+    }).rpc();
+    await sleep(10000);
+    await program.methods.finalizeVote().accounts({ caller: user, coin: I.coin, vote }).rpc();
+    const c = await program.account.coin.fetch(I.coin);
+    assert.equal(Object.keys(c.status)[0], "dead");
+    assert.isTrue((await program.account.vote.fetch(vote)).releasePassed);
+  });
+
+  it("opens a distribution that snapshots the treasury and the weights", async () => {
+    await program.methods.openDistribution().accounts({
+      caller: user, coin: I.coin, vote, treasury: I.treasury, distribution: distPda(0), systemProgram: sys,
+    }).rpc();
+    const d = await program.account.distribution.fetch(distPda(0));
+    snapshot = d.snapshot.toNumber();
+    assert.isTrue(snapshot > 0);
+    assert.isTrue(d.totalWeight.gtn(0));
+    const c = await program.account.coin.fetch(I.coin);
+    assert.equal(c.epoch, 1);
+    assert.equal(c.treasuryReserved.toNumber(), snapshot);
+    // the same vote cannot open a second distribution
+    await fails(
+      program.methods.openDistribution().accounts({
+        caller: user, coin: I.coin, vote, treasury: I.treasury, distribution: distPda(1), systemProgram: sys,
+      }).rpc(), "NotEligible");
+  });
+
+  it("claims are blocked until payouts are enabled", async () => {
+    await fails(program.methods.claimReward(0).accounts(claimAccounts()).rpc(), "PayoutsDisabled");
+  });
+
+  it("pays pro rata, capped at 5% of the snapshot, and only once", async () => {
+    await program.methods.setPayoutsEnabled(true).accounts({ admin: user, config }).rpc();
+    cap = Math.floor((snapshot * 500) / 10000);
+    const before = await bal(I.treasury);
+    await program.methods.claimReward(0).accounts(claimAccounts()).rpc();
+    assert.equal(before - (await bal(I.treasury)), cap);
+    await fails(program.methods.claimReward(0).accounts(claimAccounts()).rpc(), "AlreadyClaimed");
+    const d = await program.account.distribution.fetch(distPda(0));
+    assert.equal(d.claimedTotal.toNumber(), cap);
+  });
+
+  it("sweeps the leftover to the public pool after the claim window, never to the creator", async () => {
+    const sweepAccounts = {
+      caller: user, config, coin: I.coin, distribution: distPda(0), treasury: I.treasury,
+      publicPool: pool, systemProgram: sys,
+    };
+    await fails(program.methods.sweepUnclaimed(0).accounts(sweepAccounts).rpc(), "ClaimWindowOpen");
+    await sleep(6500);
+    const before = await bal(pool);
+    const creatorBefore = await bal(I.creatorVault);
+    await program.methods.sweepUnclaimed(0).accounts(sweepAccounts).rpc();
+    assert.equal((await bal(pool)) - before, snapshot - cap);
+    assert.equal(await bal(I.creatorVault), creatorBefore);
+    assert.equal((await program.account.coin.fetch(I.coin)).treasuryReserved.toNumber(), 0);
+    await fails(program.methods.sweepUnclaimed(0).accounts(sweepAccounts).rpc(), "AlreadySwept");
   });
 });

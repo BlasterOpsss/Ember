@@ -22,7 +22,7 @@ pub const INIT_VIRTUAL_SOL: u64 = 30_000_000_000; // 30 SOL
 #[cfg(not(feature = "short-life"))]
 pub const LIFESPANS: &[i64] = &[86_400, 604_800, 2_592_000]; // 24h, 7d, 30d
 #[cfg(feature = "short-life")]
-pub const LIFESPANS: &[i64] = &[3, 40, 604_800, 2_592_000]; // TEST BUILDS ONLY
+pub const LIFESPANS: &[i64] = &[3, 12, 40, 604_800, 2_592_000]; // TEST BUILDS ONLY
 #[cfg(not(feature = "short-life"))]
 pub const DAY_SECS: i64 = 86_400;
 #[cfg(feature = "short-life")]
@@ -33,6 +33,11 @@ pub const FINAL_WINDOW_SECS: i64 = 3_600; // no check-ins in the last hour
 pub const FINAL_WINDOW_SECS: i64 = 1; // TEST BUILDS ONLY
 pub const MIN_CHECKIN_HOLD: u64 = TOTAL_SUPPLY / 1_000; // 0.1% of supply
 pub const COMMUNITY_THRESHOLD_BPS: u128 = 3_000; // 30% of circulating supply
+pub const PAYOUT_CAP_BPS: u128 = 500; // one wallet takes at most 5% of a distribution
+#[cfg(not(feature = "short-life"))]
+pub const CLAIM_WINDOW_SECS: i64 = 30 * 86_400;
+#[cfg(feature = "short-life")]
+pub const CLAIM_WINDOW_SECS: i64 = 5; // TEST BUILDS ONLY
 #[cfg(not(feature = "short-life"))]
 pub const VOTE_SECS: i64 = 86_400;
 #[cfg(feature = "short-life")]
@@ -131,7 +136,29 @@ pub mod ember {
         let c = &mut ctx.accounts.config;
         c.admin = ctx.accounts.admin.key();
         c.platform_wallet = platform_wallet;
+        c.payouts_enabled = false;
+        c.enabled_since = 0;
         c.bump = ctx.bumps.config;
+        // Seed the public pool PDA so later transfers into it are rent-exempt.
+        transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.admin.to_account_info(),
+                    to: ctx.accounts.public_pool.to_account_info(),
+                },
+            ),
+            Rent::get()?.minimum_balance(0),
+        )
+    }
+
+    /// Admin (a multisig in production) switches treasury payouts on or off.
+    pub fn set_payouts_enabled(ctx: Context<SetPayoutsEnabled>, enabled: bool) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        if enabled && !c.payouts_enabled {
+            c.enabled_since = Clock::get()?.unix_timestamp;
+        }
+        c.payouts_enabled = enabled;
         Ok(())
     }
 
@@ -186,6 +213,10 @@ pub mod ember {
             coin.community_streak = 0;
             coin.best_community_streak = 0;
             coin.next_settle_day = day_of(now);
+            coin.epoch = 0;
+            coin.epoch_weight = 0;
+            coin.last_dist_life = 0;
+            coin.treasury_reserved = 0;
             coin.bump = bump;
         }
 
@@ -563,8 +594,14 @@ pub mod ember {
         if ws.streak_days > ws.best_streak {
             ws.best_streak = ws.streak_days;
         }
+        // Reward weight for this check-in: tokens held x current streak length.
+        let add = (bal as u128).checked_mul(ws.streak_days as u128).ok_or(EmberError::Math)?;
 
         ctx.accounts.check_in.tokens = bal;
+        let wr = &mut ctx.accounts.weight;
+        wr.weight = wr.weight.checked_add(add).ok_or(EmberError::Math)?;
+        let coin = &mut ctx.accounts.coin;
+        coin.epoch_weight = coin.epoch_weight.checked_add(add).ok_or(EmberError::Math)?;
         let ds = &mut ctx.accounts.day_stats;
         if ds.checkins == 0 {
             ds.coin = coin_key;
@@ -607,6 +644,117 @@ pub mod ember {
         Ok(())
     }
 
+    /// Anyone, after a vote is finalized, when it passed a treasury release or
+    /// the coin died. Snapshots the treasury and the epoch's total weight.
+    pub fn open_distribution(ctx: Context<OpenDistribution>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let rent = Rent::get()?.minimum_balance(0);
+        let treasury_lamports = ctx.accounts.treasury.to_account_info().lamports();
+        let vote = &ctx.accounts.vote;
+        let coin = &mut ctx.accounts.coin;
+        require!(vote.finalized, EmberError::NotEligible);
+        require!(
+            vote.release_passed || coin.status == CoinStatus::Dead,
+            EmberError::NotEligible
+        );
+        require!(vote.life_index > coin.last_dist_life, EmberError::NotEligible);
+        if coin.status == CoinStatus::Dead {
+            require!(vote.life_index == coin.life_index, EmberError::NotEligible);
+        }
+        let available = treasury_lamports
+            .saturating_sub(rent)
+            .saturating_sub(coin.treasury_reserved);
+
+        let d = &mut ctx.accounts.distribution;
+        d.coin = ctx.accounts.vote.coin;
+        d.epoch = coin.epoch;
+        d.life_index = vote.life_index;
+        d.snapshot = available;
+        d.total_weight = coin.epoch_weight;
+        d.snapshot_ts = now;
+        d.claimed_total = 0;
+        d.swept = false;
+        d.bump = ctx.bumps.distribution;
+
+        coin.treasury_reserved =
+            coin.treasury_reserved.checked_add(available).ok_or(EmberError::Math)?;
+        coin.last_dist_life = vote.life_index;
+        coin.epoch = coin.epoch.checked_add(1).ok_or(EmberError::Math)?;
+        coin.epoch_weight = 0;
+        Ok(())
+    }
+
+    /// Pays a wallet its share of a distribution: snapshot x weight / total,
+    /// capped at 5% of the snapshot. Needs payouts enabled and an open window.
+    pub fn claim_reward(ctx: Context<ClaimReward>, _epoch: u8) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(ctx.accounts.config.payouts_enabled, EmberError::PayoutsDisabled);
+        let start = ctx.accounts.distribution.snapshot_ts.max(ctx.accounts.config.enabled_since);
+        require!(
+            now <= start.checked_add(CLAIM_WINDOW_SECS).ok_or(EmberError::Math)?,
+            EmberError::ClaimWindowClosed
+        );
+        let coin_key = ctx.accounts.coin.key();
+        let payout = {
+            let d = &mut ctx.accounts.distribution;
+            let w = &mut ctx.accounts.weight;
+            require!(!w.claimed, EmberError::AlreadyClaimed);
+            require!(d.total_weight > 0 && w.weight > 0, EmberError::NothingToPay);
+            let share = (d.snapshot as u128) * w.weight / d.total_weight;
+            let cap = (d.snapshot as u128) * PAYOUT_CAP_BPS / BPS;
+            let payout = u64::try_from(share.min(cap)).map_err(|_| EmberError::Math)?;
+            require!(payout > 0, EmberError::NothingToPay);
+            w.claimed = true;
+            d.claimed_total = d.claimed_total.checked_add(payout).ok_or(EmberError::Math)?;
+            payout
+        };
+        let coin = &mut ctx.accounts.coin;
+        coin.treasury_reserved = coin.treasury_reserved.checked_sub(payout).ok_or(EmberError::Math)?;
+
+        let seeds: &[&[u8]] = &[b"treasury", coin_key.as_ref(), &[ctx.bumps.treasury]];
+        pay_from_vault(
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.treasury.to_account_info(),
+            &ctx.accounts.user.to_account_info(),
+            seeds,
+            payout,
+        )
+    }
+
+    /// Anyone, after the claim window. Leftover (unclaimed and capped amounts)
+    /// rolls back into the treasury if the coin is alive, or goes to the
+    /// public pool if it is dead. Never to the creator.
+    pub fn sweep_unclaimed(ctx: Context<SweepUnclaimed>, _epoch: u8) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(ctx.accounts.config.payouts_enabled, EmberError::PayoutsDisabled);
+        let coin_key = ctx.accounts.coin.key();
+        let dead = ctx.accounts.coin.status == CoinStatus::Dead;
+        let remaining = {
+            let d = &mut ctx.accounts.distribution;
+            require!(!d.swept, EmberError::AlreadySwept);
+            let start = d.snapshot_ts.max(ctx.accounts.config.enabled_since);
+            require!(
+                now > start.checked_add(CLAIM_WINDOW_SECS).ok_or(EmberError::Math)?,
+                EmberError::ClaimWindowOpen
+            );
+            d.swept = true;
+            d.snapshot.checked_sub(d.claimed_total).ok_or(EmberError::Math)?
+        };
+        let coin = &mut ctx.accounts.coin;
+        coin.treasury_reserved = coin.treasury_reserved.checked_sub(remaining).ok_or(EmberError::Math)?;
+        if dead && remaining > 0 {
+            let seeds: &[&[u8]] = &[b"treasury", coin_key.as_ref(), &[ctx.bumps.treasury]];
+            pay_from_vault(
+                &ctx.accounts.system_program.to_account_info(),
+                &ctx.accounts.treasury.to_account_info(),
+                &ctx.accounts.public_pool.to_account_info(),
+                seeds,
+                remaining,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Claimable any time while the coin is alive (Live or Voting).
     pub fn claim_creator_fees(ctx: Context<ClaimCreatorFees>) -> Result<()> {
         let coin = &mut ctx.accounts.coin;
@@ -636,8 +784,17 @@ pub struct InitializeConfig<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
     #[account(init, payer = admin, space = 8 + Config::INIT_SPACE, seeds = [b"config"], bump)]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [b"pool"], bump)]
+    pub public_pool: SystemAccount<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetPayoutsEnabled<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [b"config"], bump = config.bump, has_one = admin @ EmberError::NotAdmin)]
+    pub config: Box<Account<'info, Config>>,
 }
 
 #[derive(Accounts)]
@@ -646,13 +803,13 @@ pub struct CreateCoin<'info> {
     pub creator: Signer<'info>,
     #[account(init, payer = creator, space = 8 + Coin::INIT_SPACE,
         seeds = [b"coin", mint.key().as_ref()], bump)]
-    pub coin: Account<'info, Coin>,
+    pub coin: Box<Account<'info, Coin>>,
     #[account(init, payer = creator, mint::decimals = DECIMALS, mint::authority = coin,
         mint::token_program = token_program)]
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(init, payer = creator, associated_token::mint = mint,
         associated_token::authority = coin, associated_token::token_program = token_program)]
-    pub token_vault: InterfaceAccount<'info, TokenAccount>,
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [b"sol_vault", coin.key().as_ref()], bump)]
     pub sol_vault: SystemAccount<'info>,
     #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
@@ -669,16 +826,16 @@ pub struct Trade<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(seeds = [b"config"], bump = config.bump)]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
     #[account(mut, seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
-    pub coin: Account<'info, Coin>,
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub coin: Box<Account<'info, Coin>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = coin,
         associated_token::token_program = token_program)]
-    pub token_vault: InterfaceAccount<'info, TokenAccount>,
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(init_if_needed, payer = user, associated_token::mint = mint,
         associated_token::authority = user, associated_token::token_program = token_program)]
-    pub user_token: InterfaceAccount<'info, TokenAccount>,
+    pub user_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [b"sol_vault", coin.key().as_ref()], bump)]
     pub sol_vault: SystemAccount<'info>,
     #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
@@ -690,7 +847,7 @@ pub struct Trade<'info> {
     pub platform_wallet: UncheckedAccount<'info>,
     #[account(init_if_needed, payer = user, space = 8 + WalletState::INIT_SPACE,
         seeds = [b"wallet", coin.key().as_ref(), user.key().as_ref()], bump)]
-    pub wallet_state: Account<'info, WalletState>,
+    pub wallet_state: Box<Account<'info, WalletState>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -701,7 +858,7 @@ pub struct ClaimCreatorFees<'info> {
     #[account(mut, address = coin.creator @ EmberError::NotCreator)]
     pub creator: Signer<'info>,
     #[account(mut)]
-    pub coin: Account<'info, Coin>,
+    pub coin: Box<Account<'info, Coin>>,
     #[account(mut, seeds = [b"creator_vault", coin.key().as_ref()], bump)]
     pub creator_vault: SystemAccount<'info>,
     pub system_program: Program<'info, System>,
@@ -712,14 +869,14 @@ pub struct CloseCoin<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
     #[account(mut, seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
-    pub coin: Account<'info, Coin>,
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub coin: Box<Account<'info, Coin>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(associated_token::mint = mint, associated_token::authority = coin,
         associated_token::token_program = token_program)]
-    pub token_vault: InterfaceAccount<'info, TokenAccount>,
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(init, payer = caller, space = 8 + Vote::INIT_SPACE,
         seeds = [b"vote", coin.key().as_ref(), &[coin.life_index]], bump)]
-    pub vote: Account<'info, Vote>,
+    pub vote: Box<Account<'info, Vote>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
@@ -729,19 +886,19 @@ pub struct CastVote<'info> {
     #[account(mut)]
     pub voter: Signer<'info>,
     #[account(seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
-    pub coin: Account<'info, Coin>,
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub coin: Box<Account<'info, Coin>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, seeds = [b"vote", coin.key().as_ref(), &[coin.life_index]], bump = vote.bump)]
-    pub vote: Account<'info, Vote>,
+    pub vote: Box<Account<'info, Vote>>,
     #[account(init_if_needed, payer = voter, space = 8 + VoteRecord::INIT_SPACE,
         seeds = [b"voted", vote.key().as_ref(), voter.key().as_ref()], bump)]
-    pub record: Account<'info, VoteRecord>,
+    pub record: Box<Account<'info, VoteRecord>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = voter,
         associated_token::token_program = token_program)]
-    pub voter_token: InterfaceAccount<'info, TokenAccount>,
+    pub voter_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(init_if_needed, payer = voter, associated_token::mint = mint,
         associated_token::authority = vote, associated_token::token_program = token_program)]
-    pub escrow: InterfaceAccount<'info, TokenAccount>,
+    pub escrow: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -752,19 +909,19 @@ pub struct WithdrawVote<'info> {
     #[account(mut)]
     pub voter: Signer<'info>,
     #[account(has_one = mint)]
-    pub coin: Account<'info, Coin>,
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub coin: Box<Account<'info, Coin>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     /// May belong to an earlier life, so it is not derived from the current life.
     #[account(mut, has_one = coin)]
-    pub vote: Account<'info, Vote>,
+    pub vote: Box<Account<'info, Vote>>,
     #[account(mut, seeds = [b"voted", vote.key().as_ref(), voter.key().as_ref()], bump)]
-    pub record: Account<'info, VoteRecord>,
+    pub record: Box<Account<'info, VoteRecord>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = voter,
         associated_token::token_program = token_program)]
-    pub voter_token: InterfaceAccount<'info, TokenAccount>,
+    pub voter_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = vote,
         associated_token::token_program = token_program)]
-    pub escrow: InterfaceAccount<'info, TokenAccount>,
+    pub escrow: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
@@ -772,9 +929,9 @@ pub struct WithdrawVote<'info> {
 pub struct FinalizeVote<'info> {
     pub caller: Signer<'info>,
     #[account(mut)]
-    pub coin: Account<'info, Coin>,
+    pub coin: Box<Account<'info, Coin>>,
     #[account(mut, has_one = coin)]
-    pub vote: Account<'info, Vote>,
+    pub vote: Box<Account<'info, Vote>>,
 }
 
 #[derive(Accounts)]
@@ -782,15 +939,15 @@ pub struct Redeem<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(mut, seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
-    pub coin: Account<'info, Coin>,
+    pub coin: Box<Account<'info, Coin>>,
     #[account(mut)]
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = coin,
         associated_token::token_program = token_program)]
-    pub token_vault: InterfaceAccount<'info, TokenAccount>,
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = user,
         associated_token::token_program = token_program)]
-    pub user_token: InterfaceAccount<'info, TokenAccount>,
+    pub user_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [b"sol_vault", coin.key().as_ref()], bump)]
     pub sol_vault: SystemAccount<'info>,
     pub token_program: Interface<'info, TokenInterface>,
@@ -802,22 +959,25 @@ pub struct Redeem<'info> {
 pub struct CheckInCtx<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-    #[account(seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
-    pub coin: Account<'info, Coin>,
-    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(mut, seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
+    pub coin: Box<Account<'info, Coin>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(associated_token::mint = mint, associated_token::authority = user,
         associated_token::token_program = token_program)]
-    pub user_token: InterfaceAccount<'info, TokenAccount>,
+    pub user_token: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(init_if_needed, payer = user, space = 8 + WalletState::INIT_SPACE,
         seeds = [b"wallet", coin.key().as_ref(), user.key().as_ref()], bump)]
-    pub wallet_state: Account<'info, WalletState>,
+    pub wallet_state: Box<Account<'info, WalletState>>,
+    #[account(init_if_needed, payer = user, space = 8 + WeightRecord::INIT_SPACE,
+        seeds = [b"weight", coin.key().as_ref(), &[coin.epoch], user.key().as_ref()], bump)]
+    pub weight: Box<Account<'info, WeightRecord>>,
     #[account(init, payer = user, space = 8 + CheckInRecord::INIT_SPACE,
         seeds = [b"checkin", coin.key().as_ref(), &[coin.life_index], &day.to_le_bytes(), user.key().as_ref()],
         bump)]
-    pub check_in: Account<'info, CheckInRecord>,
+    pub check_in: Box<Account<'info, CheckInRecord>>,
     #[account(init_if_needed, payer = user, space = 8 + DayStats::INIT_SPACE,
         seeds = [b"day", coin.key().as_ref(), &[coin.life_index], &day.to_le_bytes()], bump)]
-    pub day_stats: Account<'info, DayStats>,
+    pub day_stats: Box<Account<'info, DayStats>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
@@ -828,14 +988,68 @@ pub struct SettleDay<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
     #[account(mut, seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
-    pub coin: Account<'info, Coin>,
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub coin: Box<Account<'info, Coin>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(associated_token::mint = mint, associated_token::authority = coin,
         associated_token::token_program = token_program)]
-    pub token_vault: InterfaceAccount<'info, TokenAccount>,
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(init_if_needed, payer = caller, space = 8 + DayStats::INIT_SPACE,
         seeds = [b"day", coin.key().as_ref(), &[coin.life_index], &day.to_le_bytes()], bump)]
-    pub day_stats: Account<'info, DayStats>,
+    pub day_stats: Box<Account<'info, DayStats>>,
     pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct OpenDistribution<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    #[account(mut)]
+    pub coin: Box<Account<'info, Coin>>,
+    #[account(has_one = coin)]
+    pub vote: Box<Account<'info, Vote>>,
+    #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
+    pub treasury: SystemAccount<'info>,
+    #[account(init, payer = caller, space = 8 + Distribution::INIT_SPACE,
+        seeds = [b"dist", coin.key().as_ref(), &[coin.epoch]], bump)]
+    pub distribution: Box<Account<'info, Distribution>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch: u8)]
+pub struct ClaimReward<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut)]
+    pub coin: Box<Account<'info, Coin>>,
+    #[account(mut, has_one = coin, seeds = [b"dist", coin.key().as_ref(), &[epoch]],
+        bump = distribution.bump)]
+    pub distribution: Box<Account<'info, Distribution>>,
+    #[account(mut, seeds = [b"weight", coin.key().as_ref(), &[epoch], user.key().as_ref()], bump)]
+    pub weight: Box<Account<'info, WeightRecord>>,
+    #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
+    pub treasury: SystemAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch: u8)]
+pub struct SweepUnclaimed<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut)]
+    pub coin: Box<Account<'info, Coin>>,
+    #[account(mut, has_one = coin, seeds = [b"dist", coin.key().as_ref(), &[epoch]],
+        bump = distribution.bump)]
+    pub distribution: Box<Account<'info, Distribution>>,
+    #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
+    pub treasury: SystemAccount<'info>,
+    #[account(mut, seeds = [b"pool"], bump)]
+    pub public_pool: SystemAccount<'info>,
     pub system_program: Program<'info, System>,
 }

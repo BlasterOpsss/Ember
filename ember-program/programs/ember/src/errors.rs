@@ -58,4 +58,20 @@ pub enum EmberError {
     WrongSettleDay,
     #[msg("That day is after the end of this life")]
     DayAfterEnd,
+    #[msg("Treasury payouts are not enabled yet")]
+    PayoutsDisabled,
+    #[msg("Only the admin can do this")]
+    NotAdmin,
+    #[msg("This vote cannot open a distribution")]
+    NotEligible,
+    #[msg("Already claimed")]
+    AlreadyClaimed,
+    #[msg("Nothing to pay for this wallet")]
+    NothingToPay,
+    #[msg("The claim window has closed")]
+    ClaimWindowClosed,
+    #[msg("The claim window is still open")]
+    ClaimWindowOpen,
+    #[msg("Already swept")]
+    AlreadySwept,
 }

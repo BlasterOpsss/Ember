@@ -5,6 +5,8 @@ use anchor_lang::prelude::*;
 pub struct Config {
     pub admin: Pubkey, // multisig
     pub platform_wallet: Pubkey,
+    pub payouts_enabled: bool, // off until the legal review is done
+    pub enabled_since: i64,
     pub bump: u8,
 }
 
@@ -48,6 +50,11 @@ pub struct Coin {
     pub community_streak: u16,
     pub best_community_streak: u16,
     pub next_settle_day: u32,
+    // Treasury payouts. An epoch runs from one distribution to the next.
+    pub epoch: u8,
+    pub epoch_weight: u128, // sum of (balance x streak) over this epoch's check-ins
+    pub last_dist_life: u8, // newest vote life already used to open a distribution
+    pub treasury_reserved: u64, // lamports in the treasury owed to open distributions
     pub bump: u8,
 }
 
@@ -114,4 +121,27 @@ pub struct VoteRecord {
     pub release_yes: bool,
     pub counts_wallet: bool,
     pub active: bool,
+}
+
+/// A wallet's share of an epoch. Seeds: ["weight", coin, epoch, wallet].
+#[account]
+#[derive(InitSpace)]
+pub struct WeightRecord {
+    pub weight: u128,
+    pub claimed: bool,
+}
+
+/// Snapshot of the treasury at a release or final death. Seeds: ["dist", coin, epoch].
+#[account]
+#[derive(InitSpace)]
+pub struct Distribution {
+    pub coin: Pubkey,
+    pub epoch: u8,
+    pub life_index: u8, // the vote life that opened it
+    pub snapshot: u64,  // lamports available to claim
+    pub total_weight: u128,
+    pub snapshot_ts: i64,
+    pub claimed_total: u64,
+    pub swept: bool,
+    pub bump: u8,
 }
