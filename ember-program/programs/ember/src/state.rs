@@ -108,7 +108,8 @@ pub struct Vote {
     pub release_no_wallets: u32,
     pub finalized: bool,
     pub revived: bool,
-    pub release_passed: bool, // recorded only; treasury payout is built later
+    pub release_passed: bool,
+    pub voter_weight: u128, // reward weight of the wallets with a live ballot; the treasury is shared on this
     pub bump: u8,
 }
 
@@ -120,7 +121,9 @@ pub struct VoteRecord {
     pub revive_yes: bool,
     pub release_yes: bool,
     pub counts_wallet: bool,
-    pub active: bool,
+    pub active: bool,   // false once the tokens leave escrow: a cancelled ballot cannot claim
+    pub weight: u128,   // reward weight frozen when the ballot was cast
+    pub claimed: bool,
 }
 
 /// A wallet's share of an epoch. Seeds: ["weight", coin, epoch, wallet].

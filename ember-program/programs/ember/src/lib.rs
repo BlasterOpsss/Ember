@@ -416,7 +416,14 @@ pub mod ember {
 
         let counts_wallet = amount >= MIN_WALLET_LOCK;
         tally(&mut ctx.accounts.vote, amount, revive_yes, release_yes, counts_wallet, true)?;
+        // Only voters share in the treasury: this wallet's reward weight for the
+        // current epoch is frozen into its ballot and added to the vote's total.
+        let weight = ctx.accounts.weight.weight;
+        let v = &mut ctx.accounts.vote;
+        v.voter_weight = v.voter_weight.checked_add(weight).ok_or(EmberError::Math)?;
         let rec = &mut ctx.accounts.record;
+        rec.weight = weight;
+        rec.claimed = false;
         rec.amount = amount;
         rec.revive_yes = revive_yes;
         rec.release_yes = release_yes;
@@ -426,7 +433,9 @@ pub mod ember {
     }
 
     /// During the vote: returns the tokens and cancels the ballot (it is
-    /// subtracted from the tally). After finalize: just returns the tokens.
+    /// subtracted from the tally and from the voters' reward weight). After
+    /// finalize: returns the tokens; the ballot stays counted in the result but
+    /// is cancelled for the treasury, so the wallet can no longer claim.
     pub fn withdraw_vote(ctx: Context<WithdrawVote>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.record.active, EmberError::NotVoted);
@@ -436,6 +445,7 @@ pub mod ember {
             if !v.finalized {
                 require!(now < v.end_ts, EmberError::VoteStillOpen);
                 tally(v, rec.amount, rec.revive_yes, rec.release_yes, rec.counts_wallet, false)?;
+                v.voter_weight = v.voter_weight.checked_sub(rec.weight).ok_or(EmberError::Math)?;
             }
             (rec.amount, v.coin, v.life_index, v.bump)
         };
@@ -645,7 +655,8 @@ pub mod ember {
     }
 
     /// Anyone, after a vote is finalized, when it passed a treasury release or
-    /// the coin died. Snapshots the treasury and the epoch's total weight.
+    /// the coin died. Snapshots the treasury and the total weight of the wallets
+    /// that voted.
     pub fn open_distribution(ctx: Context<OpenDistribution>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let rent = Rent::get()?.minimum_balance(0);
@@ -670,7 +681,7 @@ pub mod ember {
         d.epoch = coin.epoch;
         d.life_index = vote.life_index;
         d.snapshot = available;
-        d.total_weight = coin.epoch_weight;
+        d.total_weight = vote.voter_weight; // voters only
         d.snapshot_ts = now;
         d.claimed_total = 0;
         d.swept = false;
@@ -684,8 +695,10 @@ pub mod ember {
         Ok(())
     }
 
-    /// Pays a wallet its share of a distribution: snapshot x weight / total,
-    /// capped at 5% of the snapshot. Needs payouts enabled and an open window.
+    /// Pays a voter its share of a distribution: snapshot x weight / total,
+    /// capped at 5% of the snapshot. Needs payouts enabled, an open window and a
+    /// ballot that was not cancelled. Wallets that did not vote have no ballot
+    /// and cannot claim.
     pub fn claim_reward(ctx: Context<ClaimReward>, _epoch: u8) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.config.payouts_enabled, EmberError::PayoutsDisabled);
@@ -697,14 +710,15 @@ pub mod ember {
         let coin_key = ctx.accounts.coin.key();
         let payout = {
             let d = &mut ctx.accounts.distribution;
-            let w = &mut ctx.accounts.weight;
-            require!(!w.claimed, EmberError::AlreadyClaimed);
-            require!(d.total_weight > 0 && w.weight > 0, EmberError::NothingToPay);
-            let share = (d.snapshot as u128) * w.weight / d.total_weight;
+            let r = &mut ctx.accounts.record;
+            require!(r.active, EmberError::VoteCancelled);
+            require!(!r.claimed, EmberError::AlreadyClaimed);
+            require!(d.total_weight > 0 && r.weight > 0, EmberError::NothingToPay);
+            let share = (d.snapshot as u128) * r.weight / d.total_weight;
             let cap = (d.snapshot as u128) * PAYOUT_CAP_BPS / BPS;
             let payout = u64::try_from(share.min(cap)).map_err(|_| EmberError::Math)?;
             require!(payout > 0, EmberError::NothingToPay);
-            w.claimed = true;
+            r.claimed = true;
             d.claimed_total = d.claimed_total.checked_add(payout).ok_or(EmberError::Math)?;
             payout
         };
@@ -893,6 +907,10 @@ pub struct CastVote<'info> {
     #[account(init_if_needed, payer = voter, space = 8 + VoteRecord::INIT_SPACE,
         seeds = [b"voted", vote.key().as_ref(), voter.key().as_ref()], bump)]
     pub record: Box<Account<'info, VoteRecord>>,
+    /// The voter's reward weight for the current epoch (zero if never checked in).
+    #[account(init_if_needed, payer = voter, space = 8 + WeightRecord::INIT_SPACE,
+        seeds = [b"weight", coin.key().as_ref(), &[coin.epoch], voter.key().as_ref()], bump)]
+    pub weight: Box<Account<'info, WeightRecord>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = voter,
         associated_token::token_program = token_program)]
     pub voter_token: Box<InterfaceAccount<'info, TokenAccount>>,
@@ -1028,8 +1046,13 @@ pub struct ClaimReward<'info> {
     #[account(mut, has_one = coin, seeds = [b"dist", coin.key().as_ref(), &[epoch]],
         bump = distribution.bump)]
     pub distribution: Box<Account<'info, Distribution>>,
-    #[account(mut, seeds = [b"weight", coin.key().as_ref(), &[epoch], user.key().as_ref()], bump)]
-    pub weight: Box<Account<'info, WeightRecord>>,
+    /// The vote that opened this distribution.
+    #[account(has_one = coin, seeds = [b"vote", coin.key().as_ref(), &[distribution.life_index]],
+        bump = vote.bump)]
+    pub vote: Box<Account<'info, Vote>>,
+    /// The claimant's ballot in that vote. No ballot, no share.
+    #[account(mut, seeds = [b"voted", vote.key().as_ref(), user.key().as_ref()], bump)]
+    pub record: Box<Account<'info, VoteRecord>>,
     #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
     pub treasury: SystemAccount<'info>,
     pub system_program: Program<'info, System>,

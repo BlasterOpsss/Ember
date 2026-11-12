@@ -8,3 +8,7 @@
 5. `anchor test` builds and runs tests/ember.ts on a local validator.
 
 If the build fails, send me the first error and I'll fix it.
+
+## Voting and treasury rules
+- Voting locks the tokens in escrow. Taking them back out (`withdraw_vote`), during the vote or after it, cancels the ballot. A cancelled ballot cannot claim from the treasury.
+- Only wallets that voted share in the treasury. A distribution divides the snapshot by the total weight of live ballots (`Vote.voter_weight`), and `claim_reward` needs the claimant's ballot. Claim before you withdraw.

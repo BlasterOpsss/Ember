@@ -72,6 +72,8 @@ pub enum EmberError {
     ClaimWindowClosed,
     #[msg("The claim window is still open")]
     ClaimWindowOpen,
+    #[msg("This ballot was cancelled, so the wallet cannot share in the treasury")]
+    VoteCancelled,
     #[msg("Already swept")]
     AlreadySwept,
 }

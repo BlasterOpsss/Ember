@@ -64,6 +64,8 @@ const votePda = (coin: PublicKey, life: number) =>
   pda([Buffer.from("vote"), coin.toBuffer(), Buffer.from([life])]);
 const recordPda = (vote: PublicKey) =>
   pda([Buffer.from("voted"), vote.toBuffer(), user.toBuffer()]);
+const weightOfWallet = (coin: PublicKey, epoch: number, u: PublicKey) =>
+  pda([Buffer.from("weight"), coin.toBuffer(), Buffer.from([epoch]), u.toBuffer()]);
 
 describe("ember", () => {
   const mint = Keypair.generate();
@@ -176,6 +178,7 @@ describe("ending: close, vote, withdraw, revive, die, redeem", function () {
   };
   const voteAccounts = (vote: PublicKey) => ({
     voter: user, coin: I.coin, mint: m.publicKey, vote, record: recordPda(vote),
+    weight: weightOfWallet(I.coin, 0, user),
     voterToken: I.userToken, escrow: ata(m.publicKey, vote, true),
     tokenProgram: TOKEN_2022_PROGRAM_ID, associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
     systemProgram: sys,
@@ -372,7 +375,7 @@ describe("treasury payout", function () {
   let snapshot = 0;
 
   const claimAccounts = () => ({
-    user, config, coin: I.coin, distribution: distPda(0), weight: weightPda(0),
+    user, config, coin: I.coin, distribution: distPda(0), vote, record: recordPda(vote),
     treasury: I.treasury, systemProgram: sys,
   });
 
@@ -414,6 +417,7 @@ describe("treasury payout", function () {
     const all = await tokBal(I.userToken);
     await program.methods.castVote(new BN(all.toString()), false, true).accounts({
       voter: user, coin: I.coin, mint: m.publicKey, vote, record: recordPda(vote),
+      weight: weightPda(0),
       voterToken: I.userToken, escrow: ata(m.publicKey, vote, true),
       tokenProgram: TOKEN_2022_PROGRAM_ID, associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       systemProgram: sys,
@@ -508,11 +512,13 @@ const closeAs = async (mint: PublicKey) => {
   }).rpc();
   return vote;
 };
-const castAs = (mint: PublicKey, vote: PublicKey, w: Keypair | null, amount: bigint, revive: boolean, release: boolean) => {
+const castAs = async (mint: PublicKey, vote: PublicKey, w: Keypair | null, amount: bigint, revive: boolean, release: boolean) => {
   const u = pk(w);
+  const epoch = (await program.account.coin.fetch(ids(mint).coin)).epoch;
   return program.methods.castVote(new BN(amount.toString()), revive, release).accounts({
     voter: u, coin: ids(mint).coin, mint, vote,
     record: pda([Buffer.from("voted"), vote.toBuffer(), u.toBuffer()]),
+    weight: weightOfWallet(ids(mint).coin, epoch, u),
     voterToken: ata(mint, u), escrow: ata(mint, vote, true),
     tokenProgram: TOKEN_2022_PROGRAM_ID, associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
     systemProgram: sys,
@@ -608,6 +614,11 @@ describe("rules not covered above", function () {
     assert.equal(Object.keys(c.status)[0], "live");
     assert.equal(c.treasuryReserved.toNumber(), d.snapshot.toNumber());
 
+    // claim while the ballot is live, then take the tokens back
+    const cap = Math.floor((d.snapshot.toNumber() * 500) / 10000);
+    const before = await bal(I.treasury);
+    await claimFor(m.publicKey, null, 0, 1);
+
     await withdrawAs(m.publicKey, vote, null); // tokens back so the wallet can check in again
     await checkInAs(m.publicKey, 2, 1, Math.floor((await clockSecs()) / 6));
     c = await program.account.coin.fetch(I.coin);
@@ -615,13 +626,6 @@ describe("rules not covered above", function () {
     assert.equal(c.epochWeight.toString(), w1.weight.toString());
     assert.equal((await program.account.distribution.fetch(distFor(m.publicKey, 0))).totalWeight.toString(),
       d.totalWeight.toString()); // the old epoch is untouched
-
-    const cap = Math.floor((d.snapshot.toNumber() * 500) / 10000);
-    const before = await bal(I.treasury);
-    await program.methods.claimReward(0).accounts({
-      user, config, coin: I.coin, distribution: distFor(m.publicKey, 0), weight: weightFor(m.publicKey, 0),
-      treasury: I.treasury, systemProgram: sys,
-    }).rpc();
     assert.equal(before - (await bal(I.treasury)), cap);
   });
 
@@ -646,5 +650,103 @@ describe("rules not covered above", function () {
         assert.isFalse((await program.account.vote.fetch(vote)).revived);
       }
     }
+  });
+});
+
+const checkInFor = async (mint: PublicKey, w: Keypair | null, life: number, epoch: number) => {
+  const i = ids(mint), u = pk(w);
+  const day = Math.floor((await clockSecs()) / 6);
+  return program.methods.checkIn(day).accounts({
+    user: u, coin: i.coin, mint, userToken: ata(mint, u),
+    walletState: pda([Buffer.from("wallet"), i.coin.toBuffer(), u.toBuffer()]),
+    weight: weightOfWallet(i.coin, epoch, u),
+    checkIn: pda([Buffer.from("checkin"), i.coin.toBuffer(), Buffer.from([life]), dayLE(day), u.toBuffer()]),
+    dayStats: pda([Buffer.from("day"), i.coin.toBuffer(), Buffer.from([life]), dayLE(day)]),
+    tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: sys,
+  }).signers(sgn(w)).rpc();
+};
+const claimFor = (mint: PublicKey, w: Keypair | null, epoch: number, life: number) => {
+  const i = ids(mint), u = pk(w);
+  const vote = votePda(i.coin, life);
+  return program.methods.claimReward(epoch).accounts({
+    user: u, config, coin: i.coin, distribution: distFor(mint, epoch), vote,
+    record: pda([Buffer.from("voted"), vote.toBuffer(), u.toBuffer()]),
+    treasury: i.treasury, systemProgram: sys,
+  }).signers(sgn(w)).rpc();
+};
+
+// Voting and treasury rules:
+//  1. A ballot is cancelled when the locked tokens leave escrow.
+//  2. Only wallets that voted share in the treasury.
+describe("voting and treasury rules", function () {
+  this.timeout(300000);
+  const m = Keypair.generate();
+  const I = ids(m.publicKey);
+  const B = Keypair.generate(); // votes, then pulls its tokens out
+  const C = Keypair.generate(); // checks in but never votes
+  let vote: PublicKey;
+  let userW = new BN(0), bW = new BN(0);
+  let snapshot = 0;
+
+  before(async function () {
+    await createAs(this, m, 12, 0);
+    await fund(B); await fund(C);
+    await program.methods.setPayoutsEnabled(true).accounts({ admin: user, config }).rpc();
+    await buyAs(m.publicKey, null, 0.5);
+    await buyAs(m.publicKey, B, 0.5);
+    await buyAs(m.publicKey, C, 0.5);
+    await checkInFor(m.publicKey, null, 1, 0);
+    await checkInFor(m.publicKey, B, 1, 0);
+    await checkInFor(m.publicKey, C, 1, 0);
+    userW = (await program.account.weightRecord.fetch(weightOfWallet(I.coin, 0, user))).weight;
+    bW = (await program.account.weightRecord.fetch(weightOfWallet(I.coin, 0, B.publicKey))).weight;
+    await waitEnd(m.publicKey);
+    vote = await closeAs(m.publicKey);
+  });
+
+  it("a ballot adds its wallet's reward weight; withdrawing during the vote removes it", async () => {
+    await castAs(m.publicKey, vote, null, await balOf(m.publicKey, null), false, true);
+    await castAs(m.publicKey, vote, B, await balOf(m.publicKey, B), false, true);
+    let v = await program.account.vote.fetch(vote);
+    assert.equal(v.voterWeight.toString(), userW.add(bW).toString());
+    await withdrawAs(m.publicKey, vote, B);
+    v = await program.account.vote.fetch(vote);
+    assert.equal(v.voterWeight.toString(), userW.toString());
+    await castAs(m.publicKey, vote, B, await balOf(m.publicKey, B), false, true); // votes again
+    v = await program.account.vote.fetch(vote);
+    assert.equal(v.voterWeight.toString(), userW.add(bW).toString());
+  });
+
+  it("the distribution counts only the weight of voters, not of the wallet that never voted", async () => {
+    await sleep(10000);
+    await finalizeAs(m.publicKey, vote);
+    assert.equal(await statusOf(m.publicKey), "dead");
+    await program.methods.openDistribution().accounts({
+      caller: user, coin: I.coin, vote, treasury: I.treasury, distribution: distFor(m.publicKey, 0),
+      systemProgram: sys,
+    }).rpc();
+    const d = await program.account.distribution.fetch(distFor(m.publicKey, 0));
+    snapshot = d.snapshot.toNumber();
+    assert.equal(d.totalWeight.toString(), userW.add(bW).toString());
+  });
+
+  it("a wallet that did not vote cannot claim, even though it checked in", async () => {
+    await fails(claimFor(m.publicKey, C, 0, 1), "AccountNotInitialized");
+  });
+
+  it("moving the locked tokens out after voting cancels the ballot and the treasury share", async () => {
+    await withdrawAs(m.publicKey, vote, B); // tokens leave escrow
+    await fails(claimFor(m.publicKey, B, 0, 1), "VoteCancelled");
+    // the cancelled ballot still counted in the result: the vote itself is not rewritten
+    assert.isTrue((await program.account.vote.fetch(vote)).releasePassed);
+  });
+
+  it("a voter whose tokens stayed locked claims its share", async () => {
+    const share = Math.floor((snapshot * userW.toNumber()) / userW.add(bW).toNumber());
+    const cap = Math.floor((snapshot * 500) / 10000);
+    const before = await bal(I.treasury);
+    await claimFor(m.publicKey, null, 0, 1);
+    assert.equal(before - (await bal(I.treasury)), Math.min(share, cap));
+    await fails(claimFor(m.publicKey, null, 0, 1), "AlreadyClaimed");
   });
 });
