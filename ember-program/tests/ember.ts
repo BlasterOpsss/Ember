@@ -474,3 +474,177 @@ describe("treasury payout", function () {
     await fails(program.methods.sweepUnclaimed(0).accounts(sweepAccounts).rpc(), "AlreadySwept");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rules not covered above. Needs a build with --features short-life.
+// ---------------------------------------------------------------------------
+const fund = async (k: Keypair) => {
+  const sig = await provider.connection.requestAirdrop(k.publicKey, 2 * LAMPORTS_PER_SOL);
+  const bh = await provider.connection.getLatestBlockhash();
+  await provider.connection.confirmTransaction({ signature: sig, ...bh }, "confirmed");
+};
+const clockSecs = async () =>
+  Number((await provider.connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, "processed"))!.data.readBigInt64LE(32));
+const dayLE = (d: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(d); return b; };
+const sgn = (w: Keypair | null) => (w ? [w] : []);
+const pk = (w: Keypair | null) => (w ? w.publicKey : user);
+const accsFor = (mint: PublicKey, u: PublicKey) => ({
+  ...tradeAccounts(mint), user: u, userToken: ata(mint, u),
+  walletState: pda([Buffer.from("wallet"), ids(mint).coin.toBuffer(), u.toBuffer()]),
+});
+const buyAs = (mint: PublicKey, w: Keypair | null, sol: number) =>
+  program.methods.buy(SOL(sol), new BN(1)).accounts(accsFor(mint, pk(w))).signers(sgn(w)).rpc();
+const waitEnd = async (mint: PublicKey) => {
+  const end = (await program.account.coin.fetch(ids(mint).coin)).endTs.toNumber();
+  while ((await clockSecs()) < end + 1) await sleep(300);
+};
+const closeAs = async (mint: PublicKey) => {
+  const i = ids(mint);
+  const life = (await program.account.coin.fetch(i.coin)).lifeIndex;
+  const vote = votePda(i.coin, life);
+  await program.methods.closeCoin().accounts({
+    caller: user, coin: i.coin, mint, tokenVault: i.tokenVault, vote,
+    tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: sys,
+  }).rpc();
+  return vote;
+};
+const castAs = (mint: PublicKey, vote: PublicKey, w: Keypair | null, amount: bigint, revive: boolean, release: boolean) => {
+  const u = pk(w);
+  return program.methods.castVote(new BN(amount.toString()), revive, release).accounts({
+    voter: u, coin: ids(mint).coin, mint, vote,
+    record: pda([Buffer.from("voted"), vote.toBuffer(), u.toBuffer()]),
+    voterToken: ata(mint, u), escrow: ata(mint, vote, true),
+    tokenProgram: TOKEN_2022_PROGRAM_ID, associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+    systemProgram: sys,
+  }).signers(sgn(w)).rpc();
+};
+const withdrawAs = (mint: PublicKey, vote: PublicKey, w: Keypair | null) => {
+  const u = pk(w);
+  return program.methods.withdrawVote().accounts({
+    voter: u, coin: ids(mint).coin, mint, vote,
+    record: pda([Buffer.from("voted"), vote.toBuffer(), u.toBuffer()]),
+    voterToken: ata(mint, u), escrow: ata(mint, vote, true), tokenProgram: TOKEN_2022_PROGRAM_ID,
+  }).signers(sgn(w)).rpc();
+};
+const finalizeAs = (mint: PublicKey, vote: PublicKey) =>
+  program.methods.finalizeVote().accounts({ caller: user, coin: ids(mint).coin, vote }).rpc();
+const statusOf = async (mint: PublicKey) =>
+  Object.keys((await program.account.coin.fetch(ids(mint).coin)).status)[0];
+const balOf = (mint: PublicKey, w: Keypair | null) => tokBal(ata(mint, pk(w)));
+const createAs = async (ctx: any, m: Keypair, life: number, mode: number) => {
+  try {
+    await program.methods.createCoin(new BN(life), 300, 5000, 2000, mode)
+      .accounts(createAccounts(m.publicKey)).signers([m]).rpc();
+  } catch (e) {
+    if (String(e).includes("BadLifespan")) ctx.skip();
+    throw e;
+  }
+};
+const weightFor = (mint: PublicKey, epoch: number) =>
+  pda([Buffer.from("weight"), ids(mint).coin.toBuffer(), Buffer.from([epoch]), user.toBuffer()]);
+const distFor = (mint: PublicKey, epoch: number) =>
+  pda([Buffer.from("dist"), ids(mint).coin.toBuffer(), Buffer.from([epoch])]);
+const checkInAs = (mint: PublicKey, life: number, epoch: number, day: number) => {
+  const i = ids(mint);
+  return program.methods.checkIn(day).accounts({
+    user, coin: i.coin, mint, userToken: i.userToken, walletState: i.walletState,
+    weight: weightFor(mint, epoch),
+    checkIn: pda([Buffer.from("checkin"), i.coin.toBuffer(), Buffer.from([life]), dayLE(day), user.toBuffer()]),
+    dayStats: pda([Buffer.from("day"), i.coin.toBuffer(), Buffer.from([life]), dayLE(day)]),
+    tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: sys,
+  }).rpc();
+};
+
+describe("rules not covered above", function () {
+  this.timeout(300000);
+
+  it("wallet mode: two small holders outvote one big holder", async function () {
+    const m = Keypair.generate();
+    await createAs(this, m, 12, 1);
+    const B = Keypair.generate(), C = Keypair.generate();
+    await fund(B); await fund(C);
+    await buyAs(m.publicKey, null, 0.5);
+    await buyAs(m.publicKey, B, 0.1);
+    await buyAs(m.publicKey, C, 0.1);
+    await waitEnd(m.publicKey);
+    const vote = await closeAs(m.publicKey);
+    await castAs(m.publicKey, vote, null, await balOf(m.publicKey, null), false, false); // big holder says no
+    await castAs(m.publicKey, vote, B, await balOf(m.publicKey, B), true, false);
+    await castAs(m.publicKey, vote, C, await balOf(m.publicKey, C), true, false);
+    const v = await program.account.vote.fetch(vote);
+    assert.equal(v.reviveYesWallets, 2);
+    assert.equal(v.reviveNoWallets, 1);
+    assert.isTrue(v.reviveNoTokens.gt(v.reviveYesTokens)); // token weighting would kill it
+    await sleep(10000);
+    await finalizeAs(m.publicKey, vote);
+    assert.equal(await statusOf(m.publicKey), "live");
+    assert.equal((await program.account.coin.fetch(ids(m.publicKey).coin)).lifeIndex, 2);
+  });
+
+  it("a release vote can pass while the coin lives on; weights restart in a new epoch", async function () {
+    const m = Keypair.generate();
+    const I = ids(m.publicKey);
+    await createAs(this, m, 12, 0);
+    await program.methods.setPayoutsEnabled(true).accounts({ admin: user, config }).rpc();
+    await buyAs(m.publicKey, null, 0.5);
+    await checkInAs(m.publicKey, 1, 0, Math.floor((await clockSecs()) / 6));
+    await waitEnd(m.publicKey);
+    const vote = await closeAs(m.publicKey);
+    await castAs(m.publicKey, vote, null, await balOf(m.publicKey, null), true, true);
+    await sleep(10000);
+    await finalizeAs(m.publicKey, vote);
+    const v = await program.account.vote.fetch(vote);
+    assert.isTrue(v.revived);
+    assert.isTrue(v.releasePassed);
+    assert.equal(await statusOf(m.publicKey), "live");
+
+    await program.methods.openDistribution().accounts({
+      caller: user, coin: I.coin, vote, treasury: I.treasury, distribution: distFor(m.publicKey, 0),
+      systemProgram: sys,
+    }).rpc();
+    let c = await program.account.coin.fetch(I.coin);
+    const d = await program.account.distribution.fetch(distFor(m.publicKey, 0));
+    assert.equal(c.epoch, 1);
+    assert.equal(Object.keys(c.status)[0], "live");
+    assert.equal(c.treasuryReserved.toNumber(), d.snapshot.toNumber());
+
+    await withdrawAs(m.publicKey, vote, null); // tokens back so the wallet can check in again
+    await checkInAs(m.publicKey, 2, 1, Math.floor((await clockSecs()) / 6));
+    c = await program.account.coin.fetch(I.coin);
+    const w1 = await program.account.weightRecord.fetch(weightFor(m.publicKey, 1));
+    assert.equal(c.epochWeight.toString(), w1.weight.toString());
+    assert.equal((await program.account.distribution.fetch(distFor(m.publicKey, 0))).totalWeight.toString(),
+      d.totalWeight.toString()); // the old epoch is untouched
+
+    const cap = Math.floor((d.snapshot.toNumber() * 500) / 10000);
+    const before = await bal(I.treasury);
+    await program.methods.claimReward(0).accounts({
+      user, config, coin: I.coin, distribution: distFor(m.publicKey, 0), weight: weightFor(m.publicKey, 0),
+      treasury: I.treasury, systemProgram: sys,
+    }).rpc();
+    assert.equal(before - (await bal(I.treasury)), cap);
+  });
+
+  it("a coin can be revived only twice: the third vote ends it even if everyone says yes", async function () {
+    const m = Keypair.generate();
+    await createAs(this, m, 3, 0);
+    await buyAs(m.publicKey, null, 0.5);
+    for (let life = 1; life <= 3; life++) {
+      await waitEnd(m.publicKey);
+      const vote = await closeAs(m.publicKey);
+      await castAs(m.publicKey, vote, null, await balOf(m.publicKey, null), true, false);
+      await sleep(10000);
+      await finalizeAs(m.publicKey, vote);
+      await withdrawAs(m.publicKey, vote, null);
+      const c = await program.account.coin.fetch(ids(m.publicKey).coin);
+      if (life < 3) {
+        assert.equal(c.lifeIndex, life + 1);
+        assert.equal(await statusOf(m.publicKey), "live");
+      } else {
+        assert.equal(await statusOf(m.publicKey), "dead");
+        assert.equal(c.lifeIndex, 3);
+        assert.isFalse((await program.account.vote.fetch(vote)).revived);
+      }
+    }
+  });
+});
