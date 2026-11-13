@@ -19,6 +19,14 @@ pub enum CoinStatus {
 
 /// Locked at launch. Quorum is always measured in tokens; the mode only
 /// changes how the majority is counted.
+/// Mortal coins live for 24h, 7d or 30d and use the revival vote. No Death
+/// coins (lifetime) never close, never vote, and pay rewards on a timer.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
+pub enum CoinKind {
+    Mortal,
+    NoDeath,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
 pub enum VoteMode {
     Token,  // each locked token is one vote
@@ -31,8 +39,9 @@ pub struct Coin {
     pub creator: Pubkey,
     pub mint: Pubkey,
     pub status: CoinStatus,
+    pub kind: CoinKind,
     pub vote_mode: VoteMode,
-    pub life_index: u8,
+    pub life_index: u16, // unlimited revivals
     pub start_ts: i64,
     pub end_ts: i64,
     // Locked at creation, never changed.
@@ -51,9 +60,10 @@ pub struct Coin {
     pub best_community_streak: u16,
     pub next_settle_day: u32,
     // Treasury payouts. An epoch runs from one distribution to the next.
-    pub epoch: u8,
+    pub epoch: u16,
+    pub epoch_start_ts: i64, // when the current reward epoch began (No Death coins)
     pub epoch_weight: u128, // sum of (balance x streak) over this epoch's check-ins
-    pub last_dist_life: u8, // newest vote life already used to open a distribution
+    pub last_dist_life: u16, // newest vote life already used to open a distribution
     pub treasury_reserved: u64, // lamports in the treasury owed to open distributions
     pub bump: u8,
 }
@@ -67,6 +77,8 @@ pub struct WalletState {
     pub best_streak: u16,
     pub last_checkin_day: u32,
     pub total_checkins: u32,
+    // Selling during an epoch forfeits that epoch's rewards (the votes stay).
+    pub last_sold_epoch_plus1: u32, // epoch of the latest sell, plus one (0 = never sold)
 }
 
 /// Marker that a wallet checked in on a day. Existing = already checked in.
@@ -94,7 +106,7 @@ pub struct DayStats {
 #[derive(InitSpace)]
 pub struct Vote {
     pub coin: Pubkey,
-    pub life_index: u8,
+    pub life_index: u16,
     pub end_ts: i64,
     pub circulating_snapshot: u64, // supply held outside the curve at close
     pub locked_tokens: u64,        // turnout for quorum
@@ -108,8 +120,7 @@ pub struct Vote {
     pub release_no_wallets: u32,
     pub finalized: bool,
     pub revived: bool,
-    pub release_passed: bool,
-    pub voter_weight: u128, // reward weight of the wallets with a live ballot; the treasury is shared on this
+    pub release_passed: bool, // recorded only; treasury payout is built later
     pub bump: u8,
 }
 
@@ -121,9 +132,7 @@ pub struct VoteRecord {
     pub revive_yes: bool,
     pub release_yes: bool,
     pub counts_wallet: bool,
-    pub active: bool,   // false once the tokens leave escrow: a cancelled ballot cannot claim
-    pub weight: u128,   // reward weight frozen when the ballot was cast
-    pub claimed: bool,
+    pub active: bool,
 }
 
 /// A wallet's share of an epoch. Seeds: ["weight", coin, epoch, wallet].
@@ -132,6 +141,7 @@ pub struct VoteRecord {
 pub struct WeightRecord {
     pub weight: u128,
     pub claimed: bool,
+    pub forfeited: bool, // sold during the epoch
 }
 
 /// Snapshot of the treasury at a release or final death. Seeds: ["dist", coin, epoch].
@@ -139,8 +149,8 @@ pub struct WeightRecord {
 #[derive(InitSpace)]
 pub struct Distribution {
     pub coin: Pubkey,
-    pub epoch: u8,
-    pub life_index: u8, // the vote life that opened it
+    pub epoch: u16,
+    pub life_index: u16, // the vote life that opened it (0 for timed rewards)
     pub snapshot: u64,  // lamports available to claim
     pub total_weight: u128,
     pub snapshot_ts: i64,

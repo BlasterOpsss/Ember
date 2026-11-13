@@ -57,7 +57,6 @@ pub fn sol_out(virtual_sol: u64, virtual_token: u64, tokens_in: u64) -> Option<u
 }
 
 
-pub const MAX_LIVES: u8 = 3; // the first life plus two revivals
 
 /// Turnout: locked tokens as a share of circulating supply at close.
 pub fn quorum_met(locked: u64, circulating: u64, quorum_bps: u16) -> bool {

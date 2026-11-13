@@ -33,6 +33,10 @@ pub const FINAL_WINDOW_SECS: i64 = 3_600; // no check-ins in the last hour
 pub const FINAL_WINDOW_SECS: i64 = 1; // TEST BUILDS ONLY
 pub const MIN_CHECKIN_HOLD: u64 = TOTAL_SUPPLY / 1_000; // 0.1% of supply
 pub const COMMUNITY_THRESHOLD_BPS: u128 = 3_000; // 30% of circulating supply
+#[cfg(not(feature = "short-life"))]
+pub const REWARD_EPOCH_SECS: i64 = 30 * 86_400; // No Death coins: rewards every 30 days
+#[cfg(feature = "short-life")]
+pub const REWARD_EPOCH_SECS: i64 = 8; // TEST BUILDS ONLY
 pub const PAYOUT_CAP_BPS: u128 = 500; // one wallet takes at most 5% of a distribution
 #[cfg(not(feature = "short-life"))]
 pub const CLAIM_WINDOW_SECS: i64 = 30 * 86_400;
@@ -176,7 +180,9 @@ pub mod ember {
             1 => VoteMode::Wallet,
             _ => return err!(EmberError::BadVoteMode),
         };
-        require!(LIFESPANS.contains(&lifespan_secs), EmberError::BadLifespan);
+        // 0 means lifetime: a No Death coin with no close, vote or revival.
+        let lifetime = lifespan_secs == 0;
+        require!(lifetime || LIFESPANS.contains(&lifespan_secs), EmberError::BadLifespan);
         require!(
             (PLATFORM_FEE_BPS..=MAX_TOTAL_FEE_BPS).contains(&(total_fee_bps as u64)),
             EmberError::BadFee
@@ -186,7 +192,7 @@ pub mod ember {
             EmberError::BadTreasuryShare
         );
         require!(
-            (MIN_QUORUM_BPS..=MAX_QUORUM_BPS).contains(&(quorum_bps as u64)),
+            lifetime || (MIN_QUORUM_BPS..=MAX_QUORUM_BPS).contains(&(quorum_bps as u64)),
             EmberError::BadQuorum
         );
 
@@ -198,14 +204,15 @@ pub mod ember {
             coin.creator = ctx.accounts.creator.key();
             coin.mint = mint_key;
             coin.status = CoinStatus::Live;
+            coin.kind = if lifetime { CoinKind::NoDeath } else { CoinKind::Mortal };
             coin.vote_mode = mode;
             coin.life_index = 1;
             coin.start_ts = now;
-            coin.end_ts = now.checked_add(lifespan_secs).ok_or(EmberError::Math)?;
+            coin.end_ts = if lifetime { i64::MAX } else { now.checked_add(lifespan_secs).ok_or(EmberError::Math)? };
             coin.lifespan_secs = lifespan_secs;
             coin.total_fee_bps = total_fee_bps;
             coin.treasury_share_bps = treasury_share_bps;
-            coin.quorum_bps = quorum_bps;
+            coin.quorum_bps = if lifetime { 0 } else { quorum_bps };
             coin.virtual_sol = INIT_VIRTUAL_SOL;
             coin.virtual_token = TOTAL_SUPPLY;
             coin.real_sol = 0;
@@ -214,6 +221,7 @@ pub mod ember {
             coin.best_community_streak = 0;
             coin.next_settle_day = day_of(now);
             coin.epoch = 0;
+            coin.epoch_start_ts = now;
             coin.epoch_weight = 0;
             coin.last_dist_life = 0;
             coin.treasury_reserved = 0;
@@ -335,6 +343,23 @@ pub mod ember {
             coin.real_sol = coin.real_sol.checked_sub(gross).ok_or(EmberError::Math)?;
             coin.creator_fees_claimable =
                 coin.creator_fees_claimable.checked_add(split.creator).ok_or(EmberError::Math)?;
+            // Selling during an epoch forfeits that epoch's rewards. The wallet's
+            // check-in votes stay valid, but its weight leaves the pot.
+            ctx.accounts.wallet_state.last_sold_epoch_plus1 = (coin.epoch as u32) + 1;
+            let info = ctx.accounts.weight.to_account_info();
+            if info.owner == ctx.program_id && !info.data_is_empty() {
+                let mut data = info.try_borrow_mut_data()?;
+                let mut rec = {
+                    let mut slice: &[u8] = &data;
+                    WeightRecord::try_deserialize(&mut slice)?
+                };
+                if !rec.forfeited {
+                    rec.forfeited = true;
+                    coin.epoch_weight = coin.epoch_weight.saturating_sub(rec.weight);
+                    let mut dst: &mut [u8] = &mut data;
+                    rec.try_serialize(&mut dst)?;
+                }
+            }
             (split, payout, ctx.accounts.coin.key(), ctx.bumps.sol_vault)
         };
 
@@ -416,14 +441,7 @@ pub mod ember {
 
         let counts_wallet = amount >= MIN_WALLET_LOCK;
         tally(&mut ctx.accounts.vote, amount, revive_yes, release_yes, counts_wallet, true)?;
-        // Only voters share in the treasury: this wallet's reward weight for the
-        // current epoch is frozen into its ballot and added to the vote's total.
-        let weight = ctx.accounts.weight.weight;
-        let v = &mut ctx.accounts.vote;
-        v.voter_weight = v.voter_weight.checked_add(weight).ok_or(EmberError::Math)?;
         let rec = &mut ctx.accounts.record;
-        rec.weight = weight;
-        rec.claimed = false;
         rec.amount = amount;
         rec.revive_yes = revive_yes;
         rec.release_yes = release_yes;
@@ -433,9 +451,7 @@ pub mod ember {
     }
 
     /// During the vote: returns the tokens and cancels the ballot (it is
-    /// subtracted from the tally and from the voters' reward weight). After
-    /// finalize: returns the tokens; the ballot stays counted in the result but
-    /// is cancelled for the treasury, so the wallet can no longer claim.
+    /// subtracted from the tally). After finalize: just returns the tokens.
     pub fn withdraw_vote(ctx: Context<WithdrawVote>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.record.active, EmberError::NotVoted);
@@ -445,13 +461,12 @@ pub mod ember {
             if !v.finalized {
                 require!(now < v.end_ts, EmberError::VoteStillOpen);
                 tally(v, rec.amount, rec.revive_yes, rec.release_yes, rec.counts_wallet, false)?;
-                v.voter_weight = v.voter_weight.checked_sub(rec.weight).ok_or(EmberError::Math)?;
             }
             (rec.amount, v.coin, v.life_index, v.bump)
         };
         ctx.accounts.record.active = false;
 
-        let life_arr = [life];
+        let life_arr = life.to_le_bytes();
         let bump_arr = [bump];
         let seeds: &[&[u8]] = &[b"vote", coin_key.as_ref(), &life_arr, &bump_arr];
         transfer_checked(
@@ -496,7 +511,7 @@ pub mod ember {
                 v.release_no_wallets as u64,
             ),
         };
-        let revive = met && simple_majority(ry, rn) && coin.life_index < MAX_LIVES;
+        let revive = met && simple_majority(ry, rn); // no cap on revivals
         let release = met && two_thirds(ly, ln);
 
         v.finalized = true;
@@ -504,7 +519,7 @@ pub mod ember {
         v.release_passed = release;
         if revive {
             // Same curve, new life.
-            coin.life_index += 1;
+            coin.life_index = coin.life_index.checked_add(1).ok_or(EmberError::Math)?;
             coin.status = CoinStatus::Live;
             coin.start_ts = now;
             coin.end_ts = now.checked_add(coin.lifespan_secs).ok_or(EmberError::Math)?;
@@ -585,6 +600,7 @@ pub mod ember {
         require!(day == day_of(now), EmberError::WrongDay);
         let coin_key = ctx.accounts.coin.key();
         let end_ts = ctx.accounts.coin.end_ts;
+        let epoch_plus1 = (ctx.accounts.coin.epoch as u32) + 1;
         require!(ctx.accounts.coin.status == CoinStatus::Live, EmberError::NotLive);
         require!(
             now.checked_add(FINAL_WINDOW_SECS).ok_or(EmberError::Math)? < end_ts,
@@ -604,14 +620,21 @@ pub mod ember {
         if ws.streak_days > ws.best_streak {
             ws.best_streak = ws.streak_days;
         }
-        // Reward weight for this check-in: tokens held x current streak length.
-        let add = (bal as u128).checked_mul(ws.streak_days as u128).ok_or(EmberError::Math)?;
+        // Reward weight: tokens held x streak. A wallet that sold this epoch still
+        // votes (its check-in counts everywhere) but earns no weight.
+        let sold_now = ws.last_sold_epoch_plus1 == epoch_plus1;
 
         ctx.accounts.check_in.tokens = bal;
         let wr = &mut ctx.accounts.weight;
-        wr.weight = wr.weight.checked_add(add).ok_or(EmberError::Math)?;
-        let coin = &mut ctx.accounts.coin;
-        coin.epoch_weight = coin.epoch_weight.checked_add(add).ok_or(EmberError::Math)?;
+        if sold_now {
+            wr.forfeited = true;
+        }
+        if !wr.forfeited {
+            let add = (bal as u128).checked_mul(ws.streak_days as u128).ok_or(EmberError::Math)?;
+            wr.weight = wr.weight.checked_add(add).ok_or(EmberError::Math)?;
+            let coin = &mut ctx.accounts.coin;
+            coin.epoch_weight = coin.epoch_weight.checked_add(add).ok_or(EmberError::Math)?;
+        }
         let ds = &mut ctx.accounts.day_stats;
         if ds.checkins == 0 {
             ds.coin = coin_key;
@@ -655,8 +678,7 @@ pub mod ember {
     }
 
     /// Anyone, after a vote is finalized, when it passed a treasury release or
-    /// the coin died. Snapshots the treasury and the total weight of the wallets
-    /// that voted.
+    /// the coin died. Snapshots the treasury and the epoch's total weight.
     pub fn open_distribution(ctx: Context<OpenDistribution>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let rent = Rent::get()?.minimum_balance(0);
@@ -669,6 +691,7 @@ pub mod ember {
             EmberError::NotEligible
         );
         require!(vote.life_index > coin.last_dist_life, EmberError::NotEligible);
+        require!(coin.kind == CoinKind::Mortal, EmberError::NotEligible);
         if coin.status == CoinStatus::Dead {
             require!(vote.life_index == coin.life_index, EmberError::NotEligible);
         }
@@ -681,7 +704,7 @@ pub mod ember {
         d.epoch = coin.epoch;
         d.life_index = vote.life_index;
         d.snapshot = available;
-        d.total_weight = vote.voter_weight; // voters only
+        d.total_weight = coin.epoch_weight;
         d.snapshot_ts = now;
         d.claimed_total = 0;
         d.swept = false;
@@ -692,15 +715,51 @@ pub mod ember {
         coin.last_dist_life = vote.life_index;
         coin.epoch = coin.epoch.checked_add(1).ok_or(EmberError::Math)?;
         coin.epoch_weight = 0;
+        coin.epoch_start_ts = now;
         Ok(())
     }
 
-    /// Pays a voter its share of a distribution: snapshot x weight / total,
-    /// capped at 5% of the snapshot. Needs payouts enabled, an open window and a
-    /// ballot that was not cancelled. Wallets that did not vote have no ballot
-    /// and cannot claim.
-    pub fn claim_reward(ctx: Context<ClaimReward>, _epoch: u8) -> Result<()> {
+    /// No Death coins only: rewards open on a timer instead of a vote.
+    /// Anyone can call it once the reward epoch is over.
+    pub fn open_timed_distribution(ctx: Context<OpenTimedDistribution>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
+        let rent = Rent::get()?.minimum_balance(0);
+        let treasury_lamports = ctx.accounts.treasury.to_account_info().lamports();
+        let coin_key = ctx.accounts.coin.key();
+        let coin = &mut ctx.accounts.coin;
+        require!(coin.kind == CoinKind::NoDeath, EmberError::NotNoDeath);
+        require!(
+            now >= coin.epoch_start_ts.checked_add(REWARD_EPOCH_SECS).ok_or(EmberError::Math)?,
+            EmberError::EpochNotOver
+        );
+        let available = treasury_lamports
+            .saturating_sub(rent)
+            .saturating_sub(coin.treasury_reserved);
+
+        let d = &mut ctx.accounts.distribution;
+        d.coin = coin_key;
+        d.epoch = coin.epoch;
+        d.life_index = 0;
+        d.snapshot = available;
+        d.total_weight = coin.epoch_weight;
+        d.snapshot_ts = now;
+        d.claimed_total = 0;
+        d.swept = false;
+        d.bump = ctx.bumps.distribution;
+
+        coin.treasury_reserved =
+            coin.treasury_reserved.checked_add(available).ok_or(EmberError::Math)?;
+        coin.epoch = coin.epoch.checked_add(1).ok_or(EmberError::Math)?;
+        coin.epoch_weight = 0;
+        coin.epoch_start_ts = now;
+        Ok(())
+    }
+
+    /// Pays a wallet its share of a distribution: snapshot x weight / total,
+    /// capped at 5% of the snapshot. Needs payouts enabled and an open window.
+    pub fn claim_reward(ctx: Context<ClaimReward>, _epoch: u16) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(!ctx.accounts.weight.forfeited, EmberError::Forfeited);
         require!(ctx.accounts.config.payouts_enabled, EmberError::PayoutsDisabled);
         let start = ctx.accounts.distribution.snapshot_ts.max(ctx.accounts.config.enabled_since);
         require!(
@@ -710,15 +769,14 @@ pub mod ember {
         let coin_key = ctx.accounts.coin.key();
         let payout = {
             let d = &mut ctx.accounts.distribution;
-            let r = &mut ctx.accounts.record;
-            require!(r.active, EmberError::VoteCancelled);
-            require!(!r.claimed, EmberError::AlreadyClaimed);
-            require!(d.total_weight > 0 && r.weight > 0, EmberError::NothingToPay);
-            let share = (d.snapshot as u128) * r.weight / d.total_weight;
+            let w = &mut ctx.accounts.weight;
+            require!(!w.claimed, EmberError::AlreadyClaimed);
+            require!(d.total_weight > 0 && w.weight > 0, EmberError::NothingToPay);
+            let share = (d.snapshot as u128) * w.weight / d.total_weight;
             let cap = (d.snapshot as u128) * PAYOUT_CAP_BPS / BPS;
             let payout = u64::try_from(share.min(cap)).map_err(|_| EmberError::Math)?;
             require!(payout > 0, EmberError::NothingToPay);
-            r.claimed = true;
+            w.claimed = true;
             d.claimed_total = d.claimed_total.checked_add(payout).ok_or(EmberError::Math)?;
             payout
         };
@@ -738,7 +796,7 @@ pub mod ember {
     /// Anyone, after the claim window. Leftover (unclaimed and capped amounts)
     /// rolls back into the treasury if the coin is alive, or goes to the
     /// public pool if it is dead. Never to the creator.
-    pub fn sweep_unclaimed(ctx: Context<SweepUnclaimed>, _epoch: u8) -> Result<()> {
+    pub fn sweep_unclaimed(ctx: Context<SweepUnclaimed>, _epoch: u16) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.config.payouts_enabled, EmberError::PayoutsDisabled);
         let coin_key = ctx.accounts.coin.key();
@@ -862,6 +920,10 @@ pub struct Trade<'info> {
     #[account(init_if_needed, payer = user, space = 8 + WalletState::INIT_SPACE,
         seeds = [b"wallet", coin.key().as_ref(), user.key().as_ref()], bump)]
     pub wallet_state: Box<Account<'info, WalletState>>,
+    /// CHECK: the wallet's reward record for the current epoch. It may not exist yet;
+    /// selling forfeits it when it does. Seeds are checked.
+    #[account(mut, seeds = [b"weight", coin.key().as_ref(), &coin.epoch.to_le_bytes(), user.key().as_ref()], bump)]
+    pub weight: UncheckedAccount<'info>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -889,7 +951,7 @@ pub struct CloseCoin<'info> {
         associated_token::token_program = token_program)]
     pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(init, payer = caller, space = 8 + Vote::INIT_SPACE,
-        seeds = [b"vote", coin.key().as_ref(), &[coin.life_index]], bump)]
+        seeds = [b"vote", coin.key().as_ref(), &coin.life_index.to_le_bytes()], bump)]
     pub vote: Box<Account<'info, Vote>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
@@ -902,15 +964,11 @@ pub struct CastVote<'info> {
     #[account(seeds = [b"coin", mint.key().as_ref()], bump = coin.bump, has_one = mint)]
     pub coin: Box<Account<'info, Coin>>,
     pub mint: Box<InterfaceAccount<'info, Mint>>,
-    #[account(mut, seeds = [b"vote", coin.key().as_ref(), &[coin.life_index]], bump = vote.bump)]
+    #[account(mut, seeds = [b"vote", coin.key().as_ref(), &coin.life_index.to_le_bytes()], bump = vote.bump)]
     pub vote: Box<Account<'info, Vote>>,
     #[account(init_if_needed, payer = voter, space = 8 + VoteRecord::INIT_SPACE,
         seeds = [b"voted", vote.key().as_ref(), voter.key().as_ref()], bump)]
     pub record: Box<Account<'info, VoteRecord>>,
-    /// The voter's reward weight for the current epoch (zero if never checked in).
-    #[account(init_if_needed, payer = voter, space = 8 + WeightRecord::INIT_SPACE,
-        seeds = [b"weight", coin.key().as_ref(), &[coin.epoch], voter.key().as_ref()], bump)]
-    pub weight: Box<Account<'info, WeightRecord>>,
     #[account(mut, associated_token::mint = mint, associated_token::authority = voter,
         associated_token::token_program = token_program)]
     pub voter_token: Box<InterfaceAccount<'info, TokenAccount>>,
@@ -987,14 +1045,14 @@ pub struct CheckInCtx<'info> {
         seeds = [b"wallet", coin.key().as_ref(), user.key().as_ref()], bump)]
     pub wallet_state: Box<Account<'info, WalletState>>,
     #[account(init_if_needed, payer = user, space = 8 + WeightRecord::INIT_SPACE,
-        seeds = [b"weight", coin.key().as_ref(), &[coin.epoch], user.key().as_ref()], bump)]
+        seeds = [b"weight", coin.key().as_ref(), &coin.epoch.to_le_bytes(), user.key().as_ref()], bump)]
     pub weight: Box<Account<'info, WeightRecord>>,
     #[account(init, payer = user, space = 8 + CheckInRecord::INIT_SPACE,
-        seeds = [b"checkin", coin.key().as_ref(), &[coin.life_index], &day.to_le_bytes(), user.key().as_ref()],
+        seeds = [b"checkin", coin.key().as_ref(), &coin.life_index.to_le_bytes(), &day.to_le_bytes(), user.key().as_ref()],
         bump)]
     pub check_in: Box<Account<'info, CheckInRecord>>,
     #[account(init_if_needed, payer = user, space = 8 + DayStats::INIT_SPACE,
-        seeds = [b"day", coin.key().as_ref(), &[coin.life_index], &day.to_le_bytes()], bump)]
+        seeds = [b"day", coin.key().as_ref(), &coin.life_index.to_le_bytes(), &day.to_le_bytes()], bump)]
     pub day_stats: Box<Account<'info, DayStats>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
@@ -1012,7 +1070,7 @@ pub struct SettleDay<'info> {
         associated_token::token_program = token_program)]
     pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(init_if_needed, payer = caller, space = 8 + DayStats::INIT_SPACE,
-        seeds = [b"day", coin.key().as_ref(), &[coin.life_index], &day.to_le_bytes()], bump)]
+        seeds = [b"day", coin.key().as_ref(), &coin.life_index.to_le_bytes(), &day.to_le_bytes()], bump)]
     pub day_stats: Box<Account<'info, DayStats>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
@@ -1029,13 +1087,13 @@ pub struct OpenDistribution<'info> {
     #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
     pub treasury: SystemAccount<'info>,
     #[account(init, payer = caller, space = 8 + Distribution::INIT_SPACE,
-        seeds = [b"dist", coin.key().as_ref(), &[coin.epoch]], bump)]
+        seeds = [b"dist", coin.key().as_ref(), &coin.epoch.to_le_bytes()], bump)]
     pub distribution: Box<Account<'info, Distribution>>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(epoch: u8)]
+#[instruction(epoch: u16)]
 pub struct ClaimReward<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
@@ -1043,23 +1101,18 @@ pub struct ClaimReward<'info> {
     pub config: Box<Account<'info, Config>>,
     #[account(mut)]
     pub coin: Box<Account<'info, Coin>>,
-    #[account(mut, has_one = coin, seeds = [b"dist", coin.key().as_ref(), &[epoch]],
+    #[account(mut, has_one = coin, seeds = [b"dist", coin.key().as_ref(), &epoch.to_le_bytes()],
         bump = distribution.bump)]
     pub distribution: Box<Account<'info, Distribution>>,
-    /// The vote that opened this distribution.
-    #[account(has_one = coin, seeds = [b"vote", coin.key().as_ref(), &[distribution.life_index]],
-        bump = vote.bump)]
-    pub vote: Box<Account<'info, Vote>>,
-    /// The claimant's ballot in that vote. No ballot, no share.
-    #[account(mut, seeds = [b"voted", vote.key().as_ref(), user.key().as_ref()], bump)]
-    pub record: Box<Account<'info, VoteRecord>>,
+    #[account(mut, seeds = [b"weight", coin.key().as_ref(), &epoch.to_le_bytes(), user.key().as_ref()], bump)]
+    pub weight: Box<Account<'info, WeightRecord>>,
     #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
     pub treasury: SystemAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(epoch: u8)]
+#[instruction(epoch: u16)]
 pub struct SweepUnclaimed<'info> {
     #[account(mut)]
     pub caller: Signer<'info>,
@@ -1067,12 +1120,26 @@ pub struct SweepUnclaimed<'info> {
     pub config: Box<Account<'info, Config>>,
     #[account(mut)]
     pub coin: Box<Account<'info, Coin>>,
-    #[account(mut, has_one = coin, seeds = [b"dist", coin.key().as_ref(), &[epoch]],
+    #[account(mut, has_one = coin, seeds = [b"dist", coin.key().as_ref(), &epoch.to_le_bytes()],
         bump = distribution.bump)]
     pub distribution: Box<Account<'info, Distribution>>,
     #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
     pub treasury: SystemAccount<'info>,
     #[account(mut, seeds = [b"pool"], bump)]
     pub public_pool: SystemAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct OpenTimedDistribution<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    #[account(mut)]
+    pub coin: Box<Account<'info, Coin>>,
+    #[account(mut, seeds = [b"treasury", coin.key().as_ref()], bump)]
+    pub treasury: SystemAccount<'info>,
+    #[account(init, payer = caller, space = 8 + Distribution::INIT_SPACE,
+        seeds = [b"dist", coin.key().as_ref(), &coin.epoch.to_le_bytes()], bump)]
+    pub distribution: Box<Account<'info, Distribution>>,
     pub system_program: Program<'info, System>,
 }

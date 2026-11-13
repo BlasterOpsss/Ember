@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 
 #[error_code]
 pub enum EmberError {
-    #[msg("Lifespan must be 24 hours, 7 days or 30 days")]
+    #[msg("Lifespan must be 24 hours, 7 days, 30 days, or 0 for lifetime")]
     BadLifespan,
     #[msg("Total fee must be 1% to 5%, including the 1% platform fee")]
     BadFee,
@@ -72,8 +72,12 @@ pub enum EmberError {
     ClaimWindowClosed,
     #[msg("The claim window is still open")]
     ClaimWindowOpen,
-    #[msg("This ballot was cancelled, so the wallet cannot share in the treasury")]
-    VoteCancelled,
     #[msg("Already swept")]
     AlreadySwept,
+    #[msg("This wallet sold during the period and forfeited its rewards")]
+    Forfeited,
+    #[msg("Only No Death (lifetime) coins pay timed rewards")]
+    NotNoDeath,
+    #[msg("The reward epoch has not ended yet")]
+    EpochNotOver,
 }
